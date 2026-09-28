@@ -94,18 +94,36 @@ plugins:
 ```
 
 Legacy single-key form (`api_key: user_...`) still works and equals a
-one-member pool. Weighted-random selection per request; transport errors,
-All non-2xx HTTP responses (including 400, 402 and 403), transport errors,
-and stream read errors before the first normalized output chunk fail over to
-the next member. Each request tries every enabled member at most once per
-round, for up to **3 rounds**, waiting **1 second** before round 2 and
-**2 seconds** before round 3. Two enabled keys therefore allow at most 6
-attempts. Cancellation stops retries and backoff immediately; if all attempts
-fail, the last error is returned. Once streaming output starts, errors are
-forwarded without retrying, to avoid duplicate output or tool calls.
+one-member pool. Selection is weighted-random per request.
 
-Invalid requests also retry, which can increase latency; ambiguous transport
-failures may cause duplicate upstream processing or billing. Members with `proxy_url`
+### Failover
+
+Retryable — fails over to the next member:
+
+- transport errors (connection reset, timeout, DNS)
+- `401`, `402`, `429` and `5xx`
+- any other `4xx`/`5xx` whose body carries a quota or billing signal:
+  `insufficient_quota`, `insufficient_credits`, `insufficient credit`,
+  `insufficient_balance`, `exceeded your current quota`, `quota
+  exceeded`/`exhausted`/`depleted`/`reached`, `credit balance`, `balance too
+  low`, `not enough credits`, `out of credits`, `no credits`, `no remaining
+  quota`, `payment required`, `billing`. This is how a `403` that really means
+  "this account is out of quota" still switches accounts.
+
+Never retryable — validation and permission failures (`400`, `403` without a
+quota signal, `404`, `422`, `3xx`) return the original upstream error
+immediately, because another key cannot fix a malformed request.
+
+Each round tries every enabled member once. At most **3 rounds**, waiting
+**1 second** before round 2 and **2 seconds** before round 3, so two enabled
+keys allow at most 6 attempts. Cancellation stops retries and backoff
+immediately; if every attempt fails, the last error is returned.
+
+Failover applies only before the first normalized output chunk: a stream that
+fails after output starts is forwarded without replay, to avoid duplicate
+output or tool calls. Transport failures stay ambiguous — the upstream may
+have processed the request before the connection broke, so a retry can
+duplicate upstream work or billing. Members with `proxy_url`
 (http/https/socks5) use a self-built transport — host request-log cannot
 capture those outbound calls. Members with `disabled: true` are excluded
 from selection without deleting them; disabling every defined member fails
@@ -121,6 +139,27 @@ docker restart cli-proxy-api
 docker logs cli-proxy-api | grep commandcode
 # pluginhost: plugin registered plugin_id=commandcode plugin_name=CommandCode Provider
 ```
+
+### Install from a registry URL
+
+The plugin store installs from a `registry.json` source, not from a repository
+URL. Add this fork's registry as an extra source:
+
+```yaml
+plugins:
+  enabled: true
+  store-sources:
+    - "https://raw.githubusercontent.com/xspeed1989/cpa-plugin-commandcode/main/registry.json"
+```
+
+Then install `commandcode` from the management UI, or call
+`POST /v0/management/plugin-store/commandcode/install?source=<source-id>`.
+Entries without an `install` block resolve as `github-release`: tag
+`v<version>` must carry `commandcode_<version>_<goos>_<goarch>.zip` plus
+`checksums.txt`, which the tag-triggered workflow in
+`.github/workflows/build.yml` publishes. To ship a change this way, bump the
+version in `registry.json`, `plugin.go`, `cmd/commandcode/abi.go`, `build.sh`
+and this README, then push tag `v<version>`.
 
 Optional overrides:
 
@@ -146,7 +185,7 @@ to `dlopen`). Requires Go >= 1.26:
 Runs `go vet`, `go test`, then `go build -buildmode=c-shared` for
 `./cmd/commandcode`, emitting `commandcode-v<version>.so` into
 `plugins/linux/amd64/`. The build injects the same version into the plugin's ABI
-registration metadata; the default artifact and metadata version is `0.3.3`.
+registration metadata; the default artifact and metadata version is `0.3.4`.
 
 ## Test
 
@@ -157,8 +196,11 @@ go vet ./... && go test ./...
 Covers the reasoning backfill (details-array priority, plain-string
 fallback, existing-`reasoning_content` passthrough), SSE buffering and
 normalization (split reads, stacked `data:` collapse, malformed/control-line
-filtering, `[DONE]` swallowing), exact-path framing policy, error/cancellation
-propagation, alias→upstream model mapping, and router ownership.
+filtering, `[DONE]` swallowing), exact-path framing policy, failover
+classification (which status codes and quota signals switch accounts, which
+fail fast), retry rounds and backoff, cancellation, stream-error boundaries,
+error/cancellation propagation, alias→upstream model mapping, and router
+ownership.
 
 ## Release
 

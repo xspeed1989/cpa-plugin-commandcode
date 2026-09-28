@@ -227,6 +227,68 @@ func (d stdDoer) doStream(ctx context.Context, url string, headers http.Header, 
 	return resp.StatusCode, resp.Header, ch, nil
 }
 
+// quotaSignals are substrings that mark an upstream response as "this account
+// is out of quota or unpaid". They matter for statuses whose code alone is
+// ambiguous (a 403 is usually a real permission error), so the response body
+// decides whether another pool member is worth trying.
+var quotaSignals = []string{
+	"insufficient_quota",
+	"insufficient_credits",
+	"insufficient credit",
+	"insufficient_balance",
+	"exceeded your current quota",
+	"quota exceeded",
+	"quota exhausted",
+	"quota depleted",
+	"quota reached",
+	"credit balance",
+	"balance too low",
+	"not enough credits",
+	"out of credits",
+	"no credits",
+	"no remaining quota",
+	"payment required",
+	"billing",
+}
+
+// retryable reports whether an upstream failure is worth failing over to the
+// next pool member.
+//
+// Always retryable: transport errors, 401 (bad/expired key — another member
+// may be fine), 402, 429 and 5xx.
+// Conditionally retryable: any other 4xx/5xx whose body carries a quota or
+// billing signal, because that account is exhausted rather than the request
+// being wrong.
+// Never retryable: everything else (400/403/404/422 validation and permission
+// errors, 3xx): another key cannot fix a malformed request.
+func retryable(status int, err error, body []byte) bool {
+	if err != nil {
+		return true
+	}
+	if status == 401 || status == 402 || status == 429 || (status >= 500 && status <= 599) {
+		return true
+	}
+	if status < 400 {
+		return false
+	}
+	return quotaExhausted(body)
+}
+
+// quotaExhausted reports whether an error body mentions exhausted quota,
+// credits or billing.
+func quotaExhausted(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(body))
+	for _, signal := range quotaSignals {
+		if strings.Contains(lower, signal) {
+			return true
+		}
+	}
+	return false
+}
+
 // proxyTransport builds an http.RoundTripper honoring http/https/socks5
 // proxy URLs (with optional user:pass credentials).
 func proxyTransport(proxyURL string) (http.RoundTripper, error) {

@@ -15,6 +15,7 @@ type failoverHTTPClient struct {
 	keys               []string
 	failCalls          int
 	status             int
+	body               []byte
 	transportErr       error
 	streamErr          error
 	cancel             context.CancelFunc
@@ -27,7 +28,11 @@ func (c *failoverHTTPClient) Do(_ context.Context, req pluginapi.HTTPRequest) (p
 		c.cancel()
 	}
 	if len(c.keys) <= c.failCalls {
-		return pluginapi.HTTPResponse{StatusCode: c.status, Body: []byte(`{"error":{"message":"upstream failed"}}`)}, c.transportErr
+		body := c.body
+		if body == nil {
+			body = []byte(`{"error":{"message":"upstream failed"}}`)
+		}
+		return pluginapi.HTTPResponse{StatusCode: c.status, Body: body}, c.transportErr
 	}
 	return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"choices":[]}`)}, nil
 }
@@ -70,16 +75,54 @@ func runFailoverRequest(ctx context.Context, c *failoverHTTPClient, stream bool)
 	return nil
 }
 
-func TestExecutorAllErrorsFailOver(t *testing.T) {
-	for _, status := range []int{300, 400, 401, 402, 403, 404, 422, 429, 500, 503} {
+func TestExecutorFailoverClassification(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		body    string
+		retries bool
+	}{
+		{name: "unauthorized", status: 401, body: `{}`, retries: true},
+		{name: "payment required", status: 402, body: `{"error":{"message":"Payment required"}}`, retries: true},
+		{name: "rate limited", status: 429, body: `{}`, retries: true},
+		{name: "upstream failure", status: 500, body: `{}`, retries: true},
+		{name: "upstream unavailable", status: 503, body: `{}`, retries: true},
+		{name: "forbidden quota code", status: 403, body: `{"error":{"code":"insufficient_quota","message":"Account exhausted"}}`, retries: true},
+		{name: "forbidden credits", status: 403, body: `{"error":{"message":"Insufficient credits. Please top up."}}`, retries: true},
+		{name: "forbidden balance", status: 403, body: `{"error":{"message":"Your credit balance is too low"}}`, retries: true},
+		{name: "forbidden quota text", status: 403, body: `quota exceeded`, retries: true},
+		{name: "bad request quota body", status: 400, body: `{"error":{"code":"insufficient_quota"}}`, retries: true},
+		{name: "forbidden permission", status: 403, body: `{"error":{"code":"permission_denied","message":"Model access denied"}}`, retries: false},
+		{name: "bad request", status: 400, body: `{"error":{"message":"messages is required"}}`, retries: false},
+		{name: "not found", status: 404, body: `{"error":{"message":"model not found"}}`, retries: false},
+		{name: "unprocessable", status: 422, body: `{"error":{"message":"invalid tool schema"}}`, retries: false},
+		{name: "redirect", status: 300, body: ``, retries: false},
+		{name: "forbidden empty body", status: 403, body: ``, retries: false},
+	}
+	for _, tt := range tests {
 		for _, stream := range []bool{false, true} {
-			t.Run(fmt.Sprintf("status=%d/stream=%v", status, stream), func(t *testing.T) {
-				c := &failoverHTTPClient{status: status, failCalls: 1}
-				if err := runFailoverRequest(t.Context(), c, stream); err != nil {
-					t.Fatal(err)
+			t.Run(fmt.Sprintf("%s/stream=%v", tt.name, stream), func(t *testing.T) {
+				c := &failoverHTTPClient{status: tt.status, body: []byte(tt.body), failCalls: 1}
+				err := runFailoverRequest(t.Context(), c, stream)
+				wantCalls := 1
+				if tt.retries {
+					wantCalls = 2
 				}
-				if len(c.keys) != 2 || c.keys[0] == c.keys[1] {
-					t.Fatalf("expected two different accounts, got %v", c.keys)
+				if len(c.keys) != wantCalls {
+					t.Fatalf("upstream calls=%d, want %d; err=%v", len(c.keys), wantCalls, err)
+				}
+				if tt.retries {
+					if err != nil {
+						t.Fatal(err)
+					}
+					if c.keys[0] == c.keys[1] {
+						t.Fatal("retried the same key instead of switching accounts")
+					}
+					return
+				}
+				se, ok := err.(statusError)
+				if !ok || se.statusCode != tt.status || string(se.body) != tt.body {
+					t.Fatalf("original upstream error not preserved: %v", err)
 				}
 			})
 		}

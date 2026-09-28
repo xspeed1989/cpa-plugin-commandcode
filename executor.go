@@ -20,8 +20,9 @@ import (
 // v0.2.0: requests go through the weighted multi-key pool. Members without
 // proxy_url use the host HTTP client (host proxy policy + request-log
 // preserved); members with proxy_url use a self-built transport (host
-// request-log cannot capture those). All HTTP and transport failures try the
-// next pool member, for at most three rounds with cancellable backoff.
+// request-log cannot capture those). Retryable failures (transport errors,
+// 401/402/429/5xx, and quota-exhausted bodies on other statuses) try the next
+// pool member, for at most three rounds with cancellable backoff.
 type Executor struct {
 	cfg        *pluginConfig
 	translator *Translator
@@ -144,7 +145,7 @@ func waitForRetryRound(ctx context.Context, round int) error {
 	}
 }
 
-// Execute tries every available member once per round on any upstream error.
+// Execute tries every available member once per round on retryable errors.
 func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 	members := e.cfg.members(req)
 	if len(members) == 0 {
@@ -176,6 +177,9 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 			}
 			if status < 200 || status >= 300 {
 				lastErr = statusError{statusCode: status, body: respBody}
+				if !retryable(status, nil, respBody) {
+					return pluginapi.ExecutorResponse{}, lastErr
+				}
 				continue
 			}
 			fixed, _ := mapReasoningBody(respBody)
@@ -227,8 +231,12 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 				continue
 			}
 			if status < 200 || status >= 300 {
-				lastErr = statusError{statusCode: status, body: readStreamErrorBody(attemptCtx, chunks)}
+				errBody := readStreamErrorBody(attemptCtx, chunks)
 				cancel()
+				lastErr = statusError{statusCode: status, body: errBody}
+				if !retryable(status, nil, errBody) {
+					return pluginapi.ExecutorStreamResponse{}, lastErr
+				}
 				continue
 			}
 			output, err := primeStream(attemptCtx, cancel, convertChunks(attemptCtx, chunks, framing))

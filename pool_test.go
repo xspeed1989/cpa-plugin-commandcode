@@ -95,6 +95,45 @@ func TestClientForHostVsProxy(t *testing.T) {
 	}
 }
 
+func TestRetryable(t *testing.T) {
+	transport := fmt.Errorf("dial tcp: connection refused")
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "transport error", status: 0, want: true},
+		{name: "unauthorized", status: 401, want: true},
+		{name: "payment required", status: 402, want: true},
+		{name: "rate limited", status: 429, want: true},
+		{name: "server error", status: 500, want: true},
+		{name: "service unavailable", status: 503, want: true},
+		{name: "forbidden quota code", status: 403, body: `{"error":{"code":"insufficient_quota"}}`, want: true},
+		{name: "forbidden credits", status: 403, body: `"Insufficient credits"`, want: true},
+		{name: "forbidden billing", status: 403, body: `{"error":{"message":"Billing issue on this account"}}`, want: true},
+		{name: "bad request quota body", status: 400, body: `quota exceeded`, want: true},
+		{name: "forbidden permission", status: 403, body: `{"error":{"code":"permission_denied"}}`, want: false},
+		{name: "forbidden empty body", status: 403, want: false},
+		{name: "bad request", status: 400, body: `{"error":{"message":"messages is required"}}`, want: false},
+		{name: "not found", status: 404, want: false},
+		{name: "unprocessable", status: 422, want: false},
+		{name: "redirect", status: 300, want: false},
+		{name: "success", status: 200, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := error(nil)
+			if tt.status == 0 {
+				err = transport
+			}
+			if got := retryable(tt.status, err, []byte(tt.body)); got != tt.want {
+				t.Fatalf("retryable(%d, %q) = %v, want %v", tt.status, tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
 // stubHostClient fails every call (used only for type-selection tests).
 type stubHostClient struct{}
 
