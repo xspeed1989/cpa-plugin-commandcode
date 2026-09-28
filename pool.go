@@ -258,18 +258,3 @@ func proxyTransport(proxyURL string) (http.RoundTripper, error) {
 		return nil, fmt.Errorf("commandcode executor: unsupported proxy scheme %q", u.Scheme)
 	}
 }
-
-// retryable reports whether an upstream failure is worth failing over to
-// the next pool member: transport errors, 429, 401 (bad/expired key —
-// another member may be fine; 401 from ALL members surfaces as 401), and
-// 5xx. Other 4xx (400/403/404/422) fail fast: the request itself is bad,
-// retrying another key won't help.
-func retryable(status int, err error) bool {
-	if err != nil {
-		return true
-	}
-	if status == 401 || status == 429 || (status >= 500 && status <= 599) {
-		return true
-	}
-	return false
-}

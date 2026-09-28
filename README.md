@@ -95,7 +95,17 @@ plugins:
 
 Legacy single-key form (`api_key: user_...`) still works and equals a
 one-member pool. Weighted-random selection per request; transport errors,
-401, 429 and 5xx fail over to the next member. Members with `proxy_url`
+All non-2xx HTTP responses (including 400, 402 and 403), transport errors,
+and stream read errors before the first normalized output chunk fail over to
+the next member. Each request tries every enabled member at most once per
+round, for up to **3 rounds**, waiting **1 second** before round 2 and
+**2 seconds** before round 3. Two enabled keys therefore allow at most 6
+attempts. Cancellation stops retries and backoff immediately; if all attempts
+fail, the last error is returned. Once streaming output starts, errors are
+forwarded without retrying, to avoid duplicate output or tool calls.
+
+Invalid requests also retry, which can increase latency; ambiguous transport
+failures may cause duplicate upstream processing or billing. Members with `proxy_url`
 (http/https/socks5) use a self-built transport — host request-log cannot
 capture those outbound calls. Members with `disabled: true` are excluded
 from selection without deleting them; disabling every defined member fails

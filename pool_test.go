@@ -95,18 +95,6 @@ func TestClientForHostVsProxy(t *testing.T) {
 	}
 }
 
-func TestRetryable(t *testing.T) {
-	if !retryable(0, fmt.Errorf("dial")) {
-		t.Errorf("transport error should retry")
-	}
-	if !retryable(401, nil) || !retryable(429, nil) || !retryable(500, nil) || !retryable(503, nil) {
-		t.Errorf("401/429/5xx should retry")
-	}
-	if retryable(400, nil) || retryable(403, nil) || retryable(404, nil) || retryable(200, nil) {
-		t.Errorf("other 4xx/2xx should not retry")
-	}
-}
-
 // stubHostClient fails every call (used only for type-selection tests).
 type stubHostClient struct{}
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -19,8 +20,8 @@ import (
 // v0.2.0: requests go through the weighted multi-key pool. Members without
 // proxy_url use the host HTTP client (host proxy policy + request-log
 // preserved); members with proxy_url use a self-built transport (host
-// request-log cannot capture those). Failover retries 429/5xx/transport
-// errors on the next pool member.
+// request-log cannot capture those). All HTTP and transport failures try the
+// next pool member, for at most three rounds with cancellable backoff.
 type Executor struct {
 	cfg        *pluginConfig
 	translator *Translator
@@ -125,8 +126,25 @@ func upstreamHeaders(apiKey string, stream bool) http.Header {
 	return h
 }
 
-// Execute performs a non-streaming chat completion, failing over across
-// pool members on retryable errors (transport error, 429, 5xx).
+const maxFailoverRounds = 3
+
+// waitForRetryRound backs off for 1s before round two and 2s before round
+// three. Cancellation always wins over starting another upstream attempt.
+func waitForRetryRound(ctx context.Context, round int) error {
+	if round == 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(time.Duration(round) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
+}
+
+// Execute tries every available member once per round on any upstream error.
 func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
 	members := e.cfg.members(req)
 	if len(members) == 0 {
@@ -134,30 +152,38 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	}
 	body := e.buildUpstreamBody(req.Model, req.Payload, false)
 	var lastErr error
-	for _, idx := range e.keypool.order(members) {
-		m := members[idx]
-		d, err := e.keypool.clientFor(idx, m, req.HTTPClient)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		status, headers, respBody, err := d.do(ctx, e.endpoint(), upstreamHeaders(strings.TrimSpace(m.Key), false), body)
-		if err != nil {
-			lastErr = err
-			if retryable(0, err) && ctx.Err() == nil {
-				continue
-			}
+	for round := 0; round < maxFailoverRounds; round++ {
+		if err := waitForRetryRound(ctx, round); err != nil {
 			return pluginapi.ExecutorResponse{}, err
 		}
-		if status < 200 || status >= 300 {
-			lastErr = statusError{statusCode: status, body: respBody}
-			if retryable(status, nil) && ctx.Err() == nil {
+		for _, idx := range e.keypool.order(members) {
+			if err := ctx.Err(); err != nil {
+				return pluginapi.ExecutorResponse{}, err
+			}
+			m := members[idx]
+			d, err := e.keypool.clientFor(idx, m, req.HTTPClient)
+			if err != nil {
+				lastErr = err
 				continue
 			}
-			return pluginapi.ExecutorResponse{}, lastErr
+			status, headers, respBody, err := d.do(ctx, e.endpoint(), upstreamHeaders(strings.TrimSpace(m.Key), false), body)
+			if ctx.Err() != nil {
+				return pluginapi.ExecutorResponse{}, ctx.Err()
+			}
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if status < 200 || status >= 300 {
+				lastErr = statusError{statusCode: status, body: respBody}
+				continue
+			}
+			fixed, _ := mapReasoningBody(respBody)
+			return pluginapi.ExecutorResponse{Payload: fixed, Headers: headers}, nil
 		}
-		fixed, _ := mapReasoningBody(respBody)
-		return pluginapi.ExecutorResponse{Payload: fixed, Headers: headers}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return pluginapi.ExecutorResponse{}, err
 	}
 	if lastErr != nil {
 		return pluginapi.ExecutorResponse{}, lastErr
@@ -168,9 +194,9 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 // ExecuteStream performs a streaming chat completion. Normalized chunks stay
 // bare for OpenAI routes; /v1/messages receives one data: prefix because the
 // host's OpenAI-to-Claude translator consumes SSE-framed input. Failover
-// applies only before the first upstream byte: once a 2xx stream is
-// established, mid-stream errors propagate (already delivered bytes cannot be
-// rolled back).
+// applies only before the first normalized output chunk: even a 2xx stream
+// can fail before producing output. After output starts, errors propagate
+// without replaying the request (delivered bytes cannot be rolled back).
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
 	framing := streamFramingForRequest(req)
 	members := e.cfg.members(req)
@@ -179,34 +205,95 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 	}
 	body := e.buildUpstreamBody(req.Model, req.Payload, true)
 	var lastErr error
-	for _, idx := range e.keypool.order(members) {
-		m := members[idx]
-		d, err := e.keypool.clientFor(idx, m, req.HTTPClient)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		status, headers, chunks, err := d.doStream(ctx, e.endpoint(), upstreamHeaders(strings.TrimSpace(m.Key), true), body)
-		if err != nil {
-			lastErr = err
-			if retryable(0, err) && ctx.Err() == nil {
-				continue
-			}
+	for round := 0; round < maxFailoverRounds; round++ {
+		if err := waitForRetryRound(ctx, round); err != nil {
 			return pluginapi.ExecutorStreamResponse{}, err
 		}
-		if status < 200 || status >= 300 {
-			lastErr = statusError{statusCode: status, body: readStreamErrorBody(ctx, chunks)}
-			if retryable(status, nil) && ctx.Err() == nil {
+		for _, idx := range e.keypool.order(members) {
+			if err := ctx.Err(); err != nil {
+				return pluginapi.ExecutorStreamResponse{}, err
+			}
+			m := members[idx]
+			d, err := e.keypool.clientFor(idx, m, req.HTTPClient)
+			if err != nil {
+				lastErr = err
 				continue
 			}
-			return pluginapi.ExecutorStreamResponse{}, lastErr
+			attemptCtx, cancel := context.WithCancel(ctx)
+			status, headers, chunks, err := d.doStream(attemptCtx, e.endpoint(), upstreamHeaders(strings.TrimSpace(m.Key), true), body)
+			if err != nil {
+				cancel()
+				lastErr = err
+				continue
+			}
+			if status < 200 || status >= 300 {
+				lastErr = statusError{statusCode: status, body: readStreamErrorBody(attemptCtx, chunks)}
+				cancel()
+				continue
+			}
+			output, err := primeStream(attemptCtx, cancel, convertChunks(attemptCtx, chunks, framing))
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: output}, nil
 		}
-		return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: convertChunks(ctx, chunks, framing)}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return pluginapi.ExecutorStreamResponse{}, err
 	}
 	if lastErr != nil {
 		return pluginapi.ExecutorStreamResponse{}, lastErr
 	}
 	return pluginapi.ExecutorStreamResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "commandcode executor: all pool members failed"}
+}
+
+// primeStream waits until output is available so an initial stream error can
+// still trigger failover. It owns cancel, including the successful stream's
+// lifetime, and forwards the first chunk exactly once.
+func primeStream(ctx context.Context, cancel context.CancelFunc, in <-chan pluginapi.ExecutorStreamChunk) (<-chan pluginapi.ExecutorStreamChunk, error) {
+	var first pluginapi.ExecutorStreamChunk
+	var ok bool
+	select {
+	case <-ctx.Done():
+		cancel()
+		return nil, ctx.Err()
+	case first, ok = <-in:
+	}
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return nil, err
+	}
+	if first.Err != nil {
+		cancel()
+		return nil, first.Err
+	}
+	if !ok {
+		cancel()
+		return in, nil
+	}
+	out := make(chan pluginapi.ExecutorStreamChunk, 1)
+	out <- first
+	go func() {
+		defer close(out)
+		defer cancel()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case chunk, ok := <-in:
+				if !ok {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case out <- chunk:
+				}
+			}
+		}
+	}()
+	return out, nil
 }
 
 // convertChunks normalizes each upstream SSE data payload (reasoning
