@@ -2,18 +2,17 @@
 
 CLIProxyAPI native provider plugin for [commandcode.ai](https://api.commandcode.ai) (`api.commandcode.ai/provider/v1`).
 
-CommandCode's OpenAI-compatible endpoint returns thinking text under `reasoning`
-(string) and `reasoning_details[].text`, but never the standard
-`reasoning_content` field. CLIProxyAPI's built-in openai→claude translator only
-reads `reasoning_content`, so the field must be backfilled before translation.
-For streaming `/v1/messages`, that translator also requires each OpenAI chunk
-to arrive with an SSE `data: ` prefix; bare executor JSON is discarded.
-
 This plugin implements a full provider (`ModelProvider + ModelRouter +
-Executor + Request/Response translators`) that forwards chat-completions to
-commandcode, normalizes responses into standard OpenAI shape, and applies the
-route-specific transport framing expected by the host. This restores streaming
-thinking, text, and usage on `/v1/messages` without modifying CLIProxyAPI.
+Executor + Request/Response translators`) that calls CommandCode's **Responses
+API** at `/provider/v1/responses`. It declares both `openai-response` and
+`openai` as executor input/output formats. Responses clients keep native input,
+response objects and typed SSE events, without a Responses → Chat → Responses
+round-trip. Chat/Claude routes retain Chat Completions compatibility.
+
+For chat output, reasoning is exposed as `reasoning_content`, which CLIProxyAPI's
+built-in openai→claude translator requires. Streaming `/v1/messages` additionally
+needs each chat chunk to arrive with exactly one SSE `data: ` prefix. The plugin
+applies that route-specific framing without modifying CLIProxyAPI.
 
 ## Capabilities
 
@@ -21,28 +20,63 @@ thinking, text, and usage on `/v1/messages` without modifying CLIProxyAPI.
   `commandcode/` namespace (so they never collide with the native
   openai-compatibility channel; the ABI has no live `/v1/models` discovery).
 - `model_router` — hijacks the configured client aliases (`deepseek-flash`,
-  `deepseek-vision`, `glm-5.3-flash` by default) to this executor.
-- `executor` — POSTs to `/chat/completions` through the host HTTP client
-  (proxy policy + request-log preserved); backfills `reasoning_content` on
-  every non-streaming response and every SSE data line, then applies the
-  endpoint-specific stream framing described below.
-- `request_translator` / `response_translator` — the same reasoning backfill
-  for translated edges.
+  `glm-5.3-flash` by default) to this executor.
+- `executor` — POSTs to `/responses` through the host HTTP client
+  (proxy policy + request-log preserved). Native Responses output stays native;
+  chat output converts text, reasoning, function calls, finish reasons and usage
+  to Chat Completions, with the endpoint-specific framing described below.
+- `request_translator` / `response_translator` — model-name normalization for
+  both input protocols, native Responses identity translation and legacy chat
+  reasoning backfill.
+
+## Protocol selection
+
+The host selects input and output formats independently:
+
+- `ExecutorRequest.SourceFormat` selects input handling. Native Responses input
+  is preserved, including encrypted reasoning, previous response IDs, custom
+  tools, structured output, extension fields and large JSON integers. Only the
+  configured model alias and the execution method's `stream` flag are rewritten.
+- `ExecutorRequest.Format` selects output handling. `openai-response` returns
+  the original Responses object or typed SSE events; `openai` returns converted
+  Chat Completions messages/chunks. Missing formats retain the legacy chat
+  default (direct native calls can select Responses with `Format`).
+
+Both streaming and non-streaming execution use upstream `/responses`. For chat
+input, the executor converts `messages` into `input`, including `function_call`
+and `function_call_output` items with matching `call_id` values. Function tools
+and explicit function choices use the flat Responses schema; text/image/file
+content parts, `reasoning_effort`, `response_format` and token limits are mapped
+to their Responses equivalents. An omitted function-tool `strict` remains
+`false`, preserving Chat Completions' default schema behavior. Chat-only fields
+such as `messages`, `stream_options`, `n` and `stop` are not sent upstream; this
+filter does not apply to native Responses input.
+
+Model aliases, the API-key pool and downstream routes are unchanged; no
+configuration migration is needed. Native background response statuses are
+preserved, but the plugin does not add retrieval/cancellation HTTP endpoints.
 
 ## Streaming compatibility
 
-The host rewrites `ExecutorRequest.Format` and `SourceFormat` to the executor's
-OpenAI format, so they cannot identify the original client endpoint. The
-executor instead reads the host's public `request_path` metadata and prefixes a
-normalized chunk with exactly one `data: ` only when its value is exactly
-`/v1/messages`.
+Native Responses output is emitted as complete `event: <type>\ndata: <JSON>\n\n`
+SSE frames, preserving original JSON, sequence numbers, item IDs, annotations,
+reasoning and custom/built-in tool events. Lifecycle and empty item-header events
+are buffered until useful output or a successful terminal event is available,
+so failed attempts cannot leak their response IDs before key failover. After
+output starts, original terminal failure events are forwarded without replay.
+A native stream ending without a terminal event is reported as an error.
 
-`/v1/chat/completions` and `/v1/responses` remain bare: the Chat Completions
-handler adds HTTP SSE framing itself, while the Responses translation accepts
-bare executor chunks. Missing, non-string, unknown, or near-match paths also
-remain bare (fail closed), preventing `data: data: {...}` output. The plugin
-strips stacked upstream prefixes before applying this policy and leaves the
-host responsible for terminal events and `[DONE]`.
+For chat output, the executor reads the host's public `request_path` metadata
+and prefixes a normalized chunk with exactly one `data: ` only when its value
+is exactly `/v1/messages`. Chat Completions output stays bare for the Chat
+Completions handler, which adds HTTP SSE framing itself. Missing, non-string,
+unknown or near-match paths also remain bare (fail closed). Native Responses
+framing follows `Format`, not this endpoint metadata.
+
+The plugin strips stacked upstream `data:` prefixes and swallows `[DONE]`.
+Native Responses carries its own `response.completed`/`response.incomplete`
+terminal event; the host supplies chat protocol tails. Converted chat output
+maps final usage and does not duplicate full done/terminal snapshots.
 
 Only the separately mounted plugin artifact needs updating. No custom
 CLIProxyAPI image and no Compose, updater, configuration, or `.env` changes are
@@ -119,9 +153,10 @@ Each round tries every enabled member once. At most **3 rounds**, waiting
 keys allow at most 6 attempts. Cancellation stops retries and backoff
 immediately; if every attempt fails, the last error is returned.
 
-Failover applies only before the first normalized output chunk: a stream that
-fails after output starts is forwarded without replay, to avoid duplicate
-output or tool calls. Transport failures stay ambiguous — the upstream may
+Failover applies only before useful output: native lifecycle events are held
+until that boundary, so an early failure can switch keys without leaking a
+failed response ID or sequence. A stream that fails after output starts is
+forwarded without replay, to avoid duplicate output or tool calls. Transport failures stay ambiguous — the upstream may
 have processed the request before the connection broke, so a retry can
 duplicate upstream work or billing. Members with `proxy_url`
 (http/https/socks5) use a self-built transport — host request-log cannot
@@ -165,7 +200,7 @@ Optional overrides:
 
 ```yaml
     commandcode:
-      # Default: the three mappings shown under "Model mapping".
+      # Default: the two mappings shown under "Model mapping".
       models:
         - alias: my-alias
           name: vendor/model-name
@@ -185,7 +220,7 @@ to `dlopen`). Requires Go >= 1.26:
 Runs `go vet`, `go test`, then `go build -buildmode=c-shared` for
 `./cmd/commandcode`, emitting `commandcode-v<version>.so` into
 `plugins/linux/amd64/`. The build injects the same version into the plugin's ABI
-registration metadata; the default artifact and metadata version is `0.3.4`.
+registration metadata; the default artifact and metadata version is `0.3.5`.
 
 ## Test
 
@@ -193,8 +228,18 @@ registration metadata; the default artifact and metadata version is `0.3.4`.
 go vet ./... && go test ./...
 ```
 
-Covers the reasoning backfill (details-array priority, plain-string
-fallback, existing-`reasoning_content` passthrough), SSE buffering and
+Covers dual input/output format declarations and independent protocol
+selection, native request/response/event preservation (encrypted reasoning,
+annotations, custom tools, extension fields and integer precision), native SSE
+framing and private-prelude failover, background response statuses and
+format-correct token estimates. Also covers upstream `/responses` requests
+(model mapping, input history, function tools/results, multimodal content,
+structured output and stream flags),
+Responses-to-chat text/reasoning/tool/usage conversion, parallel tool indices,
+done-snapshot deduplication, incomplete results, in-band failure classification
+and truncated-stream boundaries. Also covers the legacy reasoning backfill
+(details-array priority, plain-string fallback, existing-`reasoning_content`
+passthrough), SSE buffering and
 normalization (split reads, stacked `data:` collapse, malformed/control-line
 filtering, `[DONE]` swallowing), exact-path framing policy, failover
 classification (which status codes and quota signals switch accounts, which

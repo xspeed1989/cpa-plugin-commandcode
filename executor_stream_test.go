@@ -62,7 +62,8 @@ func TestExecuteStreamWiresRequestPathFraming(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			executor := NewExecutor(parseConfig([]byte("api_key: test-key\n")), nil)
 			client := staticStreamHTTPClient{payloads: [][]byte{
-				[]byte("data: {\"choices\":[{\"delta\":{\"reasoning\":\"think\"}}]}\n"),
+				[]byte("data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"think\"}\n"),
+				[]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n"),
 				[]byte("data: [DONE]\n"),
 			}}
 			response, err := executor.ExecuteStream(t.Context(), pluginapi.ExecutorRequest{
@@ -78,8 +79,8 @@ func TestExecuteStreamWiresRequestPathFraming(t *testing.T) {
 			for chunk := range response.Chunks {
 				chunks = append(chunks, chunk)
 			}
-			if len(chunks) != 1 {
-				t.Fatalf("chunk count = %d, want one normalized payload", len(chunks))
+			if len(chunks) != 2 {
+				t.Fatalf("chunk count = %d, want reasoning and completion payloads", len(chunks))
 			}
 			if chunks[0].Err != nil {
 				t.Fatalf("unexpected stream error: %v", chunks[0].Err)
@@ -178,7 +179,7 @@ func TestConvertChunksForwardsTerminalErrorWithoutFraming(t *testing.T) {
 func TestConvertChunksClosesAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	input := make(chan pluginapi.HTTPStreamChunk)
-	output := convertChunks(ctx, input, streamFramingClaude)
+	output := convertChunks(ctx, input, streamFramingClaude, "", executorChatFormat)
 	cancel()
 
 	select {
@@ -209,7 +210,7 @@ func collectConvertedChunks(t *testing.T, chunks []pluginapi.HTTPStreamChunk, fr
 	close(input)
 
 	var output []pluginapi.ExecutorStreamChunk
-	for chunk := range convertChunks(context.Background(), input, framing) {
+	for chunk := range convertChunks(context.Background(), input, framing, "", executorChatFormat) {
 		output = append(output, chunk)
 	}
 	return output

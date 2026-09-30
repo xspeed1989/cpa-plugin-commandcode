@@ -4,9 +4,9 @@
     {
       "id": "commandcode",
       "name": "CommandCode Provider",
-      "description": "Native commandcode.ai provider with weighted multi-key pool, per-key proxy and quota-aware failover: routes DeepSeek/GLM models through api.commandcode.ai with reasoning normalized to reasoning_content, so /v1/messages renders thinking blocks. Model claims are configurable and the plugin does not rewrite model names unless told to, leaving alias resolution to the host.",
+      "description": "Native commandcode.ai Responses provider with weighted multi-key pool, per-key proxy and quota-aware failover. Preserves native Responses requests, objects and SSE events; retains Chat Completions/Claude compatibility with reasoning_content, function calls and usage. DeepSeek/GLM model aliases and upstream names are configurable.",
       "author": "ahoo",
-      "version": "0.3.4",
+      "version": "0.3.5",
       "repository": "https://github.com/xspeed1989/cpa-plugin-commandcode",
       "homepage": "https://github.com/xspeed1989/cpa-plugin-commandcode",
       "license": "MIT",
@@ -14,7 +14,8 @@
         "Provider",
         "commandcode",
         "deepseek",
-        "reasoning"
+        "reasoning",
+        "responses"
       ]
     }
   ]

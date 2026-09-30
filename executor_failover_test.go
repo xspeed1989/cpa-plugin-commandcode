@@ -34,7 +34,7 @@ func (c *failoverHTTPClient) Do(_ context.Context, req pluginapi.HTTPRequest) (p
 		}
 		return pluginapi.HTTPResponse{StatusCode: c.status, Body: body}, c.transportErr
 	}
-	return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"choices":[]}`)}, nil
+	return pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"id":"resp_test","object":"response","status":"completed","output":[]}`)}, nil
 }
 
 func (c *failoverHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
@@ -42,11 +42,11 @@ func (c *failoverHTTPClient) DoStream(ctx context.Context, req pluginapi.HTTPReq
 	chunks := make(chan pluginapi.HTTPStreamChunk, 2)
 	body := resp.Body
 	if resp.StatusCode == http.StatusOK {
-		body = append(append([]byte("data: "), body...), '\n')
+		body = []byte("data: {\"type\":\"response.completed\",\"response\":" + string(body) + "}\n")
 	}
 	if len(c.keys) <= c.failCalls && c.streamErr != nil {
 		if c.payloadBeforeError {
-			chunks <- pluginapi.HTTPStreamChunk{Payload: body}
+			chunks <- pluginapi.HTTPStreamChunk{Payload: []byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"before\"}\n")}
 		}
 		chunks <- pluginapi.HTTPStreamChunk{Err: c.streamErr}
 	} else {

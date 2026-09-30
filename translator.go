@@ -9,9 +9,9 @@ import (
 )
 
 // Translator converts between host canonical formats and the commandcode
-// envelope. Since commandcode speaks OpenAI chat-completions natively, the
-// request direction is a light pass-through (model-name normalization only)
-// and the response direction is the reasoning backfill in reasoning.go.
+// canonical envelopes. Model normalization applies to both Chat Completions
+// and Responses; legacy reasoning backfill only applies to chat payloads.
+// The executor owns upstream wire conversion and output-format selection.
 type Translator struct {
 	cfg *pluginConfig
 }
@@ -20,18 +20,17 @@ func NewTranslator(cfg *pluginConfig) *Translator { return &Translator{cfg: cfg}
 
 // TranslateRequest handles canonical -> commandcode. Supported edges:
 // openai->commandcode, claude->commandcode, openai-response->commandcode.
-// The host usually feeds us openai already (executor input format); other
-// edges arriving here are passed through untouched rather than failed so a
-// new host format never 500s live traffic.
+// The executor supplies its selected input format. Native Responses input
+// receives the same model-alias rewrite without changing its schema.
 func (t *Translator) TranslateRequest(ctx context.Context, req pluginapi.RequestTransformRequest) (pluginapi.PayloadResponse, error) {
 	_ = ctx
 	from := strings.ToLower(strings.TrimSpace(req.FromFormat))
 	to := strings.ToLower(strings.TrimSpace(req.ToFormat))
-	if to != "" && to != "commandcode" && to != "openai" {
+	if to != "" && to != "commandcode" && to != executorChatFormat && to != executorResponsesFormat {
 		return pluginapi.PayloadResponse{}, fmt.Errorf("unsupported request translation %s -> %s", req.FromFormat, req.ToFormat)
 	}
 	switch from {
-	case "", "openai", "commandcode":
+	case "", executorChatFormat, executorResponsesFormat, "commandcode":
 		return pluginapi.PayloadResponse{Body: t.normalizeRequestModel(req.Model, req.Body)}, nil
 	default:
 		return pluginapi.PayloadResponse{Body: append([]byte(nil), req.Body...)}, nil
@@ -46,7 +45,13 @@ func (t *Translator) TranslateResponse(ctx context.Context, req pluginapi.Respon
 	_ = ctx
 	from := strings.ToLower(strings.TrimSpace(req.FromFormat))
 	to := strings.ToLower(strings.TrimSpace(req.ToFormat))
-	if from != "" && from != "commandcode" && from != "openai" {
+	if from == executorResponsesFormat {
+		if to == "" || to == executorResponsesFormat || to == "commandcode" {
+			return pluginapi.PayloadResponse{Body: append([]byte(nil), req.Body...)}, nil
+		}
+		return pluginapi.PayloadResponse{}, fmt.Errorf("unsupported response translation %s -> %s", req.FromFormat, req.ToFormat)
+	}
+	if from != "" && from != "commandcode" && from != executorChatFormat {
 		return pluginapi.PayloadResponse{}, fmt.Errorf("unsupported response translation %s -> %s", req.FromFormat, req.ToFormat)
 	}
 	if to != "" && to != "openai" && to != "claude" && to != "openai-response" && to != "commandcode" {

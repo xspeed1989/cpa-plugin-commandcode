@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -11,11 +12,10 @@ import (
 
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
-	"github.com/tidwall/sjson"
 )
 
-// Executor forwards OpenAI chat-completions payloads to commandcode and
-// normalizes responses back into standard OpenAI shape (reasoning backfill).
+// Executor always calls upstream Responses. Host Responses input/output stay
+// native; Chat Completions input/output are converted independently as needed.
 //
 // v0.2.0: requests go through the weighted multi-key pool. Members without
 // proxy_url use the host HTTP client (host proxy policy + request-log
@@ -51,6 +51,12 @@ const missingKeyMsg = "commandcode executor: missing api key (router path passes
 
 const claudeMessagesPath = "/v1/messages"
 
+type upstreamStreamDecoder interface {
+	convert([]byte) ([][]byte, error)
+	terminal() bool
+	eofError() error
+}
+
 type streamFramingPolicy uint8
 
 const (
@@ -77,41 +83,34 @@ func (p streamFramingPolicy) apply(payload []byte) []byte {
 }
 
 func (e *Executor) endpoint() string {
-	return strings.TrimSuffix(e.cfg.baseURL(), "/") + "/chat/completions"
+	return strings.TrimRight(e.cfg.baseURL(), "/") + "/responses"
 }
 
-// buildUpstreamBody runs the request translator edge openai->commandcode so
-// model normalization stays in one place, then forces stream flags.
-func (e *Executor) buildUpstreamBody(model string, payload []byte, stream bool) []byte {
-	out, err := e.translator.TranslateRequest(context.Background(), pluginapi.RequestTransformRequest{
-		FromFormat: "openai",
+// SourceFormat selects input handling, independently of the output Format.
+// Native Responses keeps all input fields; only chat input needs conversion.
+func (e *Executor) buildUpstreamBody(ctx context.Context, req pluginapi.ExecutorRequest, stream bool) ([]byte, error) {
+	inputFormat := inputFormatForRequest(req)
+	if inputFormat != executorChatFormat && inputFormat != executorResponsesFormat {
+		return nil, statusError{statusCode: http.StatusBadRequest, msg: fmt.Sprintf("commandcode executor: unsupported input format %q", inputFormat)}
+	}
+	outputFormat := strings.ToLower(strings.TrimSpace(req.Format))
+	if outputFormat != "" && outputFormat != executorChatFormat && outputFormat != executorResponsesFormat {
+		return nil, statusError{statusCode: http.StatusBadRequest, msg: fmt.Sprintf("commandcode executor: unsupported output format %q", outputFormat)}
+	}
+	out, err := e.translator.TranslateRequest(ctx, pluginapi.RequestTransformRequest{
+		FromFormat: inputFormat,
 		ToFormat:   "commandcode",
-		Model:      model,
+		Model:      req.Model,
 		Stream:     stream,
-		Body:       payload,
+		Body:       req.Payload,
 	})
-	body := payload
-	if err == nil && len(out.Body) > 0 {
-		body = out.Body
-	}
-	return setStreamFlag(body, stream)
-}
-
-func setStreamFlag(body []byte, stream bool) []byte {
-	if len(body) == 0 {
-		return body
-	}
-	updated, err := sjson.SetBytes(body, "stream", stream)
 	if err != nil {
-		return body
+		return nil, err
 	}
-	body = updated
-	if stream {
-		if updated, err := sjson.SetBytes(body, "stream_options.include_usage", true); err == nil {
-			body = updated
-		}
+	if inputFormat == executorResponsesFormat {
+		return nativeResponsesRequest(out.Body, stream)
 	}
-	return body
+	return chatToResponses(out.Body, stream)
 }
 
 func upstreamHeaders(apiKey string, stream bool) http.Header {
@@ -151,7 +150,10 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	if len(members) == 0 {
 		return pluginapi.ExecutorResponse{}, statusError{statusCode: http.StatusUnauthorized, msg: missingKeyMsg}
 	}
-	body := e.buildUpstreamBody(req.Model, req.Payload, false)
+	body, err := e.buildUpstreamBody(ctx, req, false)
+	if err != nil {
+		return pluginapi.ExecutorResponse{}, err
+	}
 	var lastErr error
 	for round := 0; round < maxFailoverRounds; round++ {
 		if err := waitForRetryRound(ctx, round); err != nil {
@@ -182,7 +184,19 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 				}
 				continue
 			}
-			fixed, _ := mapReasoningBody(respBody)
+			var fixed []byte
+			if wantsNativeResponses(req) {
+				fixed, err = nativeResponsesBody(respBody)
+			} else {
+				fixed, err = responsesToChat(respBody, req.Model)
+			}
+			if err != nil {
+				lastErr = err
+				if !retryableExecutionError(err) {
+					return pluginapi.ExecutorResponse{}, err
+				}
+				continue
+			}
 			return pluginapi.ExecutorResponse{Payload: fixed, Headers: headers}, nil
 		}
 	}
@@ -195,19 +209,21 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	return pluginapi.ExecutorResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "commandcode executor: all pool members failed"}
 }
 
-// ExecuteStream performs a streaming chat completion. Normalized chunks stay
-// bare for OpenAI routes; /v1/messages receives one data: prefix because the
-// host's OpenAI-to-Claude translator consumes SSE-framed input. Failover
-// applies only before the first normalized output chunk: even a 2xx stream
-// can fail before producing output. After output starts, errors propagate
-// without replaying the request (delivered bytes cannot be rolled back).
+// ExecuteStream emits native Responses SSE or converted chat chunks according
+// to Format. Chat /v1/messages receives the host translator's data: prefix.
+// Failover applies only before useful output; native lifecycle events are
+// buffered until then so failed attempts cannot leak response IDs. Once output
+// starts, a failure never replays delivered text, events or tool calls.
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
 	framing := streamFramingForRequest(req)
 	members := e.cfg.members(req)
 	if len(members) == 0 {
 		return pluginapi.ExecutorStreamResponse{}, statusError{statusCode: http.StatusUnauthorized, msg: missingKeyMsg}
 	}
-	body := e.buildUpstreamBody(req.Model, req.Payload, true)
+	body, err := e.buildUpstreamBody(ctx, req, true)
+	if err != nil {
+		return pluginapi.ExecutorStreamResponse{}, err
+	}
 	var lastErr error
 	for round := 0; round < maxFailoverRounds; round++ {
 		if err := waitForRetryRound(ctx, round); err != nil {
@@ -239,9 +255,12 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 				}
 				continue
 			}
-			output, err := primeStream(attemptCtx, cancel, convertChunks(attemptCtx, chunks, framing))
+			output, err := primeStream(attemptCtx, cancel, convertChunks(attemptCtx, chunks, framing, req.Model, req.Format))
 			if err != nil {
 				lastErr = err
+				if !retryableExecutionError(err) {
+					return pluginapi.ExecutorStreamResponse{}, err
+				}
 				continue
 			}
 			return pluginapi.ExecutorStreamResponse{Headers: headers, Chunks: output}, nil
@@ -254,6 +273,16 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		return pluginapi.ExecutorStreamResponse{}, lastErr
 	}
 	return pluginapi.ExecutorStreamResponse{}, statusError{statusCode: http.StatusBadGateway, msg: "commandcode executor: all pool members failed"}
+}
+
+// In-band Responses failures follow the same classification as HTTP errors.
+// Transport/read errors retain the existing retry policy.
+func retryableExecutionError(err error) bool {
+	var failure statusError
+	if errors.As(err, &failure) {
+		return retryable(failure.statusCode, nil, failure.body)
+	}
+	return true
 }
 
 // primeStream waits until output is available so an initial stream error can
@@ -304,49 +333,56 @@ func primeStream(ctx context.Context, cancel context.CancelFunc, in <-chan plugi
 	return out, nil
 }
 
-// convertChunks normalizes each upstream SSE data payload (reasoning
-// backfill) and applies the route-specific executor framing policy.
-//
-// OpenAI chat and Responses routes stay bare because their downstream paths
-// accept or add SSE framing. Claude Messages receives one data: prefix for the
-// host's OpenAI-to-Claude translator. Empty lines are dropped, and upstream
-// [DONE] is swallowed because the host emits its own stream tail.
-//
-// The host delivers arbitrary 32KB raw reads, so one SSE line can straddle
-// two chunks. We buffer until a newline completes the line; only complete
-// lines go through normalizeStreamLine. The tail remainder is flushed when
-// the upstream closes.
-func convertChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, framing streamFramingPolicy) <-chan pluginapi.ExecutorStreamChunk {
+// convertChunks shares SSE buffering, cancellation and size limits between
+// native Responses and converted chat output. Native frames already carry
+// event:/data: framing; only chat frames use the route-specific framing policy.
+// Upstream [DONE] is swallowed; native Responses carries its own terminal event.
+func convertChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, framing streamFramingPolicy, model, outputFormat string) <-chan pluginapi.ExecutorStreamChunk {
 	// One slot lets a terminal cancellation error be reported even when the
 	// caller stops draining the stream at the same time.
 	out := make(chan pluginapi.ExecutorStreamChunk, 1)
 	go func() {
 		defer close(out)
 		var pending []byte
+		native := strings.ToLower(strings.TrimSpace(outputFormat)) == executorResponsesFormat
+		var decoder upstreamStreamDecoder = &responseStream{model: model}
+		if native {
+			decoder = &nativeResponseStream{}
+			framing = streamFramingBare
+		}
 		emitError := func(err error) {
 			terminal := pluginapi.ExecutorStreamChunk{Err: err}
 			select {
 			case out <- terminal:
 			case <-ctx.Done():
-				// If a payload already occupies the slot, cancellation must still
-				// let this goroutine terminate rather than block on error delivery.
 				select {
 				case out <- terminal:
 				default:
 				}
 			}
 		}
-		emit := func(payload []byte) bool {
-			if len(bytes.TrimSpace(payload)) == 0 {
+		processLine := func(line []byte) bool {
+			payload := streamLinePayload(line)
+			if len(payload) > 0 && !json.Valid(payload) {
+				if native {
+					emitError(statusError{statusCode: http.StatusBadGateway, msg: "commandcode executor: invalid Responses SSE JSON"})
+					return false
+				}
 				return true
 			}
-			payload = framing.apply(payload)
-			select {
-			case <-ctx.Done():
+			frames, err := decoder.convert(payload)
+			if err != nil {
+				emitError(err)
 				return false
-			case out <- pluginapi.ExecutorStreamChunk{Payload: payload}:
-				return true
 			}
+			for _, frame := range frames {
+				select {
+				case <-ctx.Done():
+					return false
+				case out <- pluginapi.ExecutorStreamChunk{Payload: framing.apply(frame)}:
+				}
+			}
+			return !decoder.terminal()
 		}
 		for {
 			select {
@@ -355,8 +391,10 @@ func convertChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, fra
 				return
 			case chunk, ok := <-in:
 				if !ok {
-					if frame := normalizeStreamLine(pending); len(bytes.TrimSpace(frame)) > 0 {
-						emit(frame)
+					if processLine(pending) {
+						if err := decoder.eofError(); err != nil {
+							emitError(err)
+						}
 					}
 					return
 				}
@@ -372,16 +410,14 @@ func convertChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, fra
 					}
 					line := pending[:idx+1]
 					pending = pending[idx+1:]
-					if !emit(normalizeStreamLine(line)) {
+					if !processLine(line) {
 						return
 					}
 				}
-				// Guard against unbounded growth on a never-ending line.
+				// Never silently discard an oversized, unfinished event.
 				if len(pending) > 4<<20 {
-					if !emit(normalizeStreamLine(pending)) {
-						return
-					}
-					pending = nil
+					emitError(statusError{statusCode: http.StatusBadGateway, msg: "commandcode executor: SSE line exceeds 4 MiB"})
+					return
 				}
 			}
 		}
@@ -389,11 +425,9 @@ func convertChunks(ctx context.Context, in <-chan pluginapi.HTTPStreamChunk, fra
 	return out
 }
 
-// normalizeStreamLine converts one complete upstream SSE line into a bare
-// JSON payload. Stacked prefixes are collapsed, reasoning_content is
-// backfilled, and empty lines and [DONE] yield nil. Route-specific framing is
-// applied later by convertChunks.
-func normalizeStreamLine(line []byte) []byte {
+// streamLinePayload strips SSE transport prefixes without touching JSON.
+// Control lines, empty data and [DONE] yield nil. The caller validates JSON.
+func streamLinePayload(line []byte) []byte {
 	trimmed := bytes.TrimSpace(line)
 	if !bytes.HasPrefix(trimmed, []byte("data:")) {
 		// Non-SSE bytes (e.g. event: lines, comments): drop, never corrupt.
@@ -407,13 +441,17 @@ func normalizeStreamLine(line []byte) []byte {
 	if len(payload) == 0 || string(payload) == "[DONE]" {
 		return nil
 	}
+	return payload
+}
+
+// normalizeStreamLine keeps the legacy chat normalization contract for helpers.
+func normalizeStreamLine(line []byte) []byte {
+	payload := streamLinePayload(line)
 	if !json.Valid(payload) {
 		return nil
 	}
-	if fixed, ok := mapReasoningBody(payload); ok {
-		return fixed
-	}
-	return payload
+	fixed, _ := mapReasoningBody(payload)
+	return fixed
 }
 
 // normalizeStreamBytes handles one raw host-stream read (kept for unit
@@ -442,6 +480,14 @@ func (e *Executor) CountTokens(ctx context.Context, req pluginapi.ExecutorReques
 	count := int64(len(req.Payload) / 4)
 	if count < 1 && len(req.Payload) > 0 {
 		count = 1
+	}
+	if wantsNativeResponses(req) {
+		raw, _ := json.Marshal(map[string]any{
+			"id": "commandcode-count", "object": "response", "created_at": 0,
+			"model": req.Model, "status": "completed", "output": []any{},
+			"usage": map[string]any{"input_tokens": count, "output_tokens": 0, "total_tokens": count},
+		})
+		return pluginapi.ExecutorResponse{Payload: raw}, nil
 	}
 	usage := map[string]any{
 		"prompt_tokens":     count,
