@@ -31,7 +31,7 @@ const (
 
 // pluginVersion tracks the release; cmd/commandcode/abi.go carries its own
 // copy for registration metadata (injected via ldflags at release time).
-var pluginVersion = "0.3.5"
+var pluginVersion = "0.3.6"
 
 // CommandCodePlugin wires model metadata, routing, translation and execution.
 type CommandCodePlugin struct {
@@ -146,9 +146,8 @@ var (
 	_ pluginapi.UsagePlugin        = (*CommandCodePlugin)(nil)
 )
 
-// normalizeModel strips provider prefixes, alias suffixes and whitespace so
-// "deepseek-flash", "commandcode/deepseek-flash" and
-// "deepseek/deepseek-v4-flash" compare equal downstream.
+// normalizeModel produces basename keys for upstream-name rewrites and legacy
+// bare shorthand. Routing uses routingModelKey instead to preserve namespaces.
 func normalizeModel(model string) string {
 	m := strings.TrimSpace(model)
 	if i := strings.LastIndex(m, "/"); i >= 0 {

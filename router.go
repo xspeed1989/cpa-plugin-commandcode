@@ -17,6 +17,16 @@ type Router struct {
 
 func NewRouter(cfg *pluginConfig) *Router { return &Router{cfg: cfg} }
 
+// routingModelKey strips whitespace and thinking suffixes, but preserves the
+// provider namespace so another provider's model cannot match by basename.
+func routingModelKey(model string) string {
+	m := strings.TrimSpace(model)
+	if i := strings.Index(m, "("); i >= 0 {
+		m = strings.TrimSpace(m[:i])
+	}
+	return strings.ToLower(m)
+}
+
 func (r *Router) owned(req pluginapi.ModelRouteRequest) bool {
 	r.cfg.ensureIndexes()
 	set := r.cfg.modelSet()
@@ -24,11 +34,9 @@ func (r *Router) owned(req pluginapi.ModelRouteRequest) bool {
 		if candidate == "" {
 			continue
 		}
-		if _, ok := set[normalizeModel(candidate)]; ok {
+		if _, ok := set[routingModelKey(candidate)]; ok {
 			return true
 		}
-		// Alias form: host aliases like "deepseek-flash" normalize to the
-		// bare name, which is in the set via the config.yaml mirror entries.
 	}
 	return false
 }

@@ -142,29 +142,31 @@ func (c *pluginConfig) effectiveModels() []ModelEntry {
 // buildIndexes derives the lookup tables once per configuration so request
 // handling stays allocation-free. Called from parseConfig only.
 //
-// Keys are built with normalizeModel so a client's "commandcode/deepseek-flash"
-// or "deepseek-flash(high)" matches the plain entry. Values are the operator's
-// literal Name: it is the vendor's identifier and must never be normalized, or
-// writing "z-ai/glm-5.3-flash" would silently become "glm-5.3-flash" and the
-// upstream would reject it.
+// Routing claims preserve configured namespaces and explicitly add commandcode/
+// variants and legacy bare shorthand. Rewrite keys still use normalizeModel;
+// values retain the operator's literal upstream Name.
 func (c *pluginConfig) buildIndexes() {
 	entries := c.effectiveModels()
 	c.claimed = make(map[string]struct{}, len(entries)*2)
 	c.rewrites = make(map[string]string, len(entries)*2)
+	addClaim := func(model string) {
+		for _, key := range []string{routingModelKey(model), normalizeModel(model)} {
+			if key != "" {
+				c.claimed[key] = struct{}{}
+				c.claimed[Provider+"/"+key] = struct{}{}
+			}
+		}
+	}
 	for _, entry := range entries {
+		addClaim(entry.Alias)
+		addClaim(entry.Name)
 		alias := normalizeModel(entry.Alias)
 		name := strings.TrimSpace(entry.Name)
-		if alias != "" {
-			c.claimed[alias] = struct{}{}
-		}
 		if name == "" {
 			// No upstream name: forward verbatim, claim the alias only.
 			continue
 		}
 		normalizedName := normalizeModel(name)
-		if normalizedName != "" {
-			c.claimed[normalizedName] = struct{}{}
-		}
 		// Both spellings resolve to the vendor's literal name, so a request
 		// arriving as either the alias or the upstream name is rewritten.
 		if alias != "" {
@@ -187,8 +189,8 @@ func (c *pluginConfig) ensureIndexes() {
 	}
 }
 
-// modelSet returns the normalized names this plugin claims, whether they are
-// client aliases or upstream names. A claim never implies a rewrite.
+// modelSet returns the namespace-preserving routing keys this plugin claims.
+// A claim never implies a rewrite.
 func (c *pluginConfig) modelSet() map[string]struct{} {
 	if c == nil || c.claimed == nil {
 		return map[string]struct{}{}

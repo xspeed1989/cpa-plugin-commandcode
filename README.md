@@ -108,6 +108,15 @@ When the vendor renames a model, edit this list — no code change. Omitting
 An entry with no `name` claims the alias but forwards it verbatim, which is
 only correct for aliases the host resolves itself.
 
+Routing preserves provider namespaces. The plugin accepts configured aliases
+and upstream names, their `commandcode/` variants, and legacy bare shorthand
+(with optional thinking suffixes). It does **not** claim another provider's model
+just because the final path segment matches. For example,
+`commandcode/deepseek/deepseek-v4.1-flash` routes to CommandCode, while
+`opencode-go/deepseek-v4.1-flash`, `opencode-go/deepseek-flash` and
+`opencode-go/glm-5.3-flash` fall through to their own providers. Explicitly
+configured aliases containing a namespace remain supported.
+
 ## Install
 
 ```yaml
@@ -220,7 +229,7 @@ to `dlopen`). Requires Go >= 1.26:
 Runs `go vet`, `go test`, then `go build -buildmode=c-shared` for
 `./cmd/commandcode`, emitting `commandcode-v<version>.so` into
 `plugins/linux/amd64/`. The build injects the same version into the plugin's ABI
-registration metadata; the default artifact and metadata version is `0.3.5`.
+registration metadata; the default artifact and metadata version is `0.3.6`.
 
 ## Test
 
@@ -245,9 +254,20 @@ filtering, `[DONE]` swallowing), exact-path framing policy, failover
 classification (which status codes and quota signals switch accounts, which
 fail fast), retry rounds and backoff, cancellation, stream-error boundaries,
 error/cancellation propagation, alias→upstream model mapping, and router
-ownership.
+ownership, including foreign-provider namespace isolation in both the requested
+model and JSON body.
 
 ## Release
+
+### v0.3.6
+
+- Fix the CommandCode model router claiming OpenCode Go and other providers'
+  prefixed DeepSeek/GLM models by their shared basename.
+- Preserve existing aliases, upstream model names, `commandcode/` variants,
+  thinking suffixes and explicitly configured namespaced aliases.
+- Add regression coverage for routing from both `RequestedModel` and JSON body.
+
+### Publishing
 
 1. `./build.sh` (or `PLUGIN_VERSION=x.y.z ./build.sh`).
 2. Package `commandcode_<version>_<goos>_<goarch>.zip` files with the

@@ -6,7 +6,7 @@
       "name": "CommandCode Provider",
       "description": "Native commandcode.ai Responses provider with weighted multi-key pool, per-key proxy and quota-aware failover. Preserves native Responses requests, objects and SSE events; retains Chat Completions/Claude compatibility with reasoning_content, function calls and usage. DeepSeek/GLM model aliases and upstream names are configurable.",
       "author": "ahoo",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "repository": "https://github.com/xspeed1989/cpa-plugin-commandcode",
       "homepage": "https://github.com/xspeed1989/cpa-plugin-commandcode",
       "license": "MIT",
