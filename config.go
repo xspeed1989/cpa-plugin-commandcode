@@ -37,16 +37,16 @@ type pluginConfig struct {
 // model covers both:
 //
 //	name  — the model name sent upstream ("deepseek/deepseek-v4.1-flash")
-//	alias — the name clients request ("deepseek-flash")
+//	alias — the relative alias clients request with a commandcode/ prefix
 //
 // The mapping is REQUIRED for this plugin's executor: it uses its own base URL,
 // so the host's alias table never applies to its requests, and commandcode
 // rejects a bare alias. Leaving Name empty forwards the client's name verbatim,
 // which is only correct for aliases the host itself resolves.
 type ModelEntry struct {
-	// Alias is the client-facing name, e.g. "deepseek-flash".
+	// Alias is the relative client-facing name, e.g. "deepseek-flash".
 	Alias string `yaml:"alias"`
-	// Name is the model name sent upstream. Empty forwards Alias unchanged.
+	// Name is the model name sent upstream. Empty disables model rewriting.
 	Name string `yaml:"name"`
 	// DisplayName is the optional label for model registration; falls back to
 	// Name, then Alias.
@@ -142,8 +142,8 @@ func (c *pluginConfig) effectiveModels() []ModelEntry {
 // buildIndexes derives the lookup tables once per configuration so request
 // handling stays allocation-free. Called from parseConfig only.
 //
-// Routing claims preserve configured namespaces and explicitly add commandcode/
-// variants and legacy bare shorthand. Rewrite keys still use normalizeModel;
+// Routing claims require the commandcode/ namespace for configured aliases,
+// upstream names and basename shorthand. Rewrite keys use normalizeModel;
 // values retain the operator's literal upstream Name.
 func (c *pluginConfig) buildIndexes() {
 	entries := c.effectiveModels()
@@ -152,7 +152,6 @@ func (c *pluginConfig) buildIndexes() {
 	addClaim := func(model string) {
 		for _, key := range []string{routingModelKey(model), normalizeModel(model)} {
 			if key != "" {
-				c.claimed[key] = struct{}{}
 				c.claimed[Provider+"/"+key] = struct{}{}
 			}
 		}
@@ -189,7 +188,7 @@ func (c *pluginConfig) ensureIndexes() {
 	}
 }
 
-// modelSet returns the namespace-preserving routing keys this plugin claims.
+// modelSet returns the commandcode-prefixed routing keys this plugin claims.
 // A claim never implies a rewrite.
 func (c *pluginConfig) modelSet() map[string]struct{} {
 	if c == nil || c.claimed == nil {

@@ -144,8 +144,8 @@ func TestConfiguredMappingOverridesDefault(t *testing.T) {
 	}
 }
 
-// An entry with no upstream claims the alias but forwards it verbatim, which is
-// what a host-routed alias needs.
+// An entry with no upstream claims its commandcode-prefixed alias but leaves
+// outbound model rewriting to the host.
 func TestEntryWithoutUpstreamForwardsVerbatim(t *testing.T) {
 	cfg := parseConfig([]byte("models:\n  - deepseek-flash\n"))
 	tr := NewTranslator(cfg)
@@ -154,19 +154,19 @@ func TestEntryWithoutUpstreamForwardsVerbatim(t *testing.T) {
 		t.Fatalf("model was rewritten: %s", got)
 	}
 	r := NewRouter(cfg)
-	resp, _ := r.RouteModel(t.Context(), requestWithModel("deepseek-flash"))
+	resp, _ := r.RouteModel(t.Context(), requestWithModel("commandcode/deepseek-flash"))
 	if !resp.Handled {
-		t.Fatal("entry should still claim the model")
+		t.Fatal("entry should still claim its commandcode-prefixed alias")
 	}
 }
 
 func TestRouterOwned(t *testing.T) {
 	r := NewRouter(&pluginConfig{})
 	for _, m := range []string{
-		"deepseek-flash",
-		"deepseek-flash(high)",       // thinking suffix
-		"commandcode/deepseek-flash", // provider prefix
-		"glm-5.3-flash",
+		"commandcode/deepseek-flash",
+		"commandcode/deepseek-flash(high)",
+		"commandcode/deepseek/deepseek-v4.1-flash",
+		"commandcode/glm-5.3-flash",
 	} {
 		resp, err := r.RouteModel(t.Context(), requestWithModel(m))
 		if err != nil {
@@ -182,12 +182,12 @@ func TestRouterOwned(t *testing.T) {
 	}
 }
 
-// Both spellings of a mapped model are claimed: the client alias and the vendor
-// name, so a request arriving either way reaches this executor.
+// Both commandcode-prefixed spellings of a mapped model are claimed: the client
+// alias and the vendor name.
 func TestRouterOwnsConfiguredNames(t *testing.T) {
 	cfg := parseConfig([]byte("models:\n  - alias: fast\n    name: deepseek/deepseek-v4.1-flash\n"))
 	r := NewRouter(cfg)
-	for _, m := range []string{"fast", "deepseek/deepseek-v4.1-flash"} {
+	for _, m := range []string{"commandcode/fast", "commandcode/deepseek/deepseek-v4.1-flash"} {
 		resp, _ := r.RouteModel(t.Context(), requestWithModel(m))
 		if !resp.Handled {
 			t.Errorf("model %q not routed", m)

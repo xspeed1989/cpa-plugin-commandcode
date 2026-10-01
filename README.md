@@ -19,8 +19,8 @@ applies that route-specific framing without modifying CLIProxyAPI.
 - `model_provider` — advertises the configured models under the
   `commandcode/` namespace (so they never collide with the native
   openai-compatibility channel; the ABI has no live `/v1/models` discovery).
-- `model_router` — hijacks the configured client aliases (`deepseek-flash`,
-  `glm-5.3-flash` by default) to this executor.
+- `model_router` — routes only configured models with the `commandcode/`
+  prefix (for example `commandcode/deepseek-flash`) to this executor.
 - `executor` — POSTs to `/responses` through the host HTTP client
   (proxy policy + request-log preserved). Native Responses output stays native;
   chat output converts text, reasoning, function calls, finish reasons and usage
@@ -52,8 +52,9 @@ to their Responses equivalents. An omitted function-tool `strict` remains
 such as `messages`, `stream_options`, `n` and `stop` are not sent upstream; this
 filter does not apply to native Responses input.
 
-Model aliases, the API-key pool and downstream routes are unchanged; no
-configuration migration is needed. Native background response statuses are
+Model mappings and the API-key pool are unchanged. Since v0.3.7, clients must
+add the `commandcode/` prefix to target this plugin; bare aliases fall through
+to the host's normal routing. Native background response statuses are
 preserved, but the plugin does not add retrieval/cancellation HTTP endpoints.
 
 ## Streaming compatibility
@@ -91,7 +92,8 @@ only accepts fully-qualified vendor names, and rejects a bare alias with
 to happen here.
 
 Fields match the host's alias convention: `name` is what goes upstream,
-`alias` is what clients send.
+`alias` is the relative client alias. Clients add the `commandcode/` prefix,
+for example `commandcode/deepseek-flash`.
 
 ```yaml
     commandcode:
@@ -105,17 +107,30 @@ Fields match the host's alias convention: `name` is what goes upstream,
 
 When the vendor renames a model, edit this list — no code change. Omitting
 `models` entirely uses the built-in defaults (those two entries).
-An entry with no `name` claims the alias but forwards it verbatim, which is
-only correct for aliases the host resolves itself.
+An entry with no `name` still requires the `commandcode/` prefix and does not
+rewrite the outbound model; use it only when the host supplies a valid upstream
+name.
 
-Routing preserves provider namespaces. The plugin accepts configured aliases
-and upstream names, their `commandcode/` variants, and legacy bare shorthand
-(with optional thinking suffixes). It does **not** claim another provider's model
-just because the final path segment matches. For example,
-`commandcode/deepseek/deepseek-v4.1-flash` routes to CommandCode, while
-`opencode-go/deepseek-v4.1-flash`, `opencode-go/deepseek-flash` and
-`opencode-go/glm-5.3-flash` fall through to their own providers. Explicitly
-configured aliases containing a namespace remain supported.
+Routing strictly requires the `commandcode/` prefix and a configured model.
+Aliases, upstream names and basename shorthand remain supported **within that
+namespace**, with optional thinking suffixes. Default examples:
+
+| Client model ID | Routed to this plugin? |
+| --- | --- |
+| `commandcode/deepseek-flash` | Yes |
+| `commandcode/deepseek-v4.1-flash(high)` | Yes |
+| `commandcode/deepseek/deepseek-v4.1-flash` | Yes |
+| `commandcode/z-ai/glm-5.3-flash` | Yes |
+| `deepseek-flash` / `deepseek-v4.1-flash` | No |
+| `deepseek/deepseek-v4.1-flash` / `glm-5.3-flash` | No |
+| `opencode-go/deepseek-v4.1-flash` | No |
+| `commandcode/gpt-5` (not configured) | No |
+
+Explicitly configured namespaced aliases also require the plugin prefix:
+`alias: team/fast` is requested as `commandcode/team/fast`, not `team/fast`.
+Whitespace and case normalization are unchanged. `RequestedModel` is
+authoritative when present; the JSON body is consulted only when that field is
+absent, so a conflicting body model cannot override the requested namespace.
 
 ## Install
 
@@ -229,7 +244,7 @@ to `dlopen`). Requires Go >= 1.26:
 Runs `go vet`, `go test`, then `go build -buildmode=c-shared` for
 `./cmd/commandcode`, emitting `commandcode-v<version>.so` into
 `plugins/linux/amd64/`. The build injects the same version into the plugin's ABI
-registration metadata; the default artifact and metadata version is `0.3.6`.
+registration metadata; the default artifact and metadata version is `0.3.7`.
 
 ## Test
 
@@ -254,10 +269,19 @@ filtering, `[DONE]` swallowing), exact-path framing policy, failover
 classification (which status codes and quota signals switch accounts, which
 fail fast), retry rounds and backoff, cancellation, stream-error boundaries,
 error/cancellation propagation, alias→upstream model mapping, and router
-ownership, including foreign-provider namespace isolation in both the requested
-model and JSON body.
+ownership, including required `commandcode/` prefixes, bare-name rejection,
+foreign-provider namespace isolation and conflicting request/body models.
 
 ## Release
+
+### v0.3.7
+
+- Require the `commandcode/` prefix for every plugin-owned model. Bare aliases,
+  bare shorthand and unprefixed vendor names no longer invoke this plugin.
+- Treat `RequestedModel` as authoritative; consult the JSON body only when it
+  is absent, preventing fallback from bypassing namespace restrictions.
+- Preserve prefixed model mappings and thinking suffixes; expand regression
+  tests and document the client-side prefix requirement.
 
 ### v0.3.6
 

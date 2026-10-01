@@ -12,14 +12,15 @@ func TestRouterRespectsModelNamespaces(t *testing.T) {
 		model string
 		owned bool
 	}{
-		{"deepseek-flash", true},
-		{"deepseek-v4.1-flash", true},
-		{"deepseek/deepseek-v4.1-flash", true},
+		{"deepseek-flash", false},
+		{"deepseek-flash(high)", false},
+		{"deepseek-v4.1-flash", false},
+		{"deepseek/deepseek-v4.1-flash", false},
 		{"commandcode/deepseek-flash", true},
 		{"commandcode/deepseek-v4.1-flash", true},
 		{"commandcode/deepseek/deepseek-v4.1-flash(high)", true},
-		{"glm-5.3-flash", true},
-		{"z-ai/glm-5.3-flash", true},
+		{"glm-5.3-flash", false},
+		{"z-ai/glm-5.3-flash", false},
 		{"commandcode/z-ai/glm-5.3-flash", true},
 		{" COMMANDCODE/DEEPSEEK-FLASH(high) ", true},
 		{"opencode-go/deepseek-v4.1-flash", false},
@@ -31,6 +32,10 @@ func TestRouterRespectsModelNamespaces(t *testing.T) {
 		{"other/deepseek-flash", false},
 		{"commandcode/opencode-go/deepseek-v4.1-flash", false},
 		{"commandcode/gpt-5", false},
+		{"commandcode-extra/deepseek-flash", false},
+		{"prefix/commandcode/deepseek-flash", false},
+		{"commandcode", false},
+		{"commandcode/", false},
 		{"gpt-5", false},
 		{"", false},
 	}
@@ -73,13 +78,15 @@ func TestRouterRespectsConfiguredModelNamespaces(t *testing.T) {
 		model string
 		owned bool
 	}{
-		{"team/fast", true},
-		{"vendor/model-name", true},
+		{"team/fast", false},
+		{"vendor/model-name", false},
 		{"commandcode/team/fast(high)", true},
 		{"commandcode/vendor/model-name", true},
-		{"fast", true},
-		{"model-name", true},
-		{"team/passthrough", true},
+		{"commandcode/fast", true},
+		{"commandcode/model-name", true},
+		{"fast", false},
+		{"model-name", false},
+		{"team/passthrough", false},
 		{"commandcode/team/passthrough", true},
 		{"other/fast", false},
 		{"other/model-name", false},

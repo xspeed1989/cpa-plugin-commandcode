@@ -31,7 +31,7 @@ const (
 
 // pluginVersion tracks the release; cmd/commandcode/abi.go carries its own
 // copy for registration metadata (injected via ldflags at release time).
-var pluginVersion = "0.3.6"
+var pluginVersion = "0.3.7"
 
 // CommandCodePlugin wires model metadata, routing, translation and execution.
 type CommandCodePlugin struct {
@@ -146,8 +146,8 @@ var (
 	_ pluginapi.UsagePlugin        = (*CommandCodePlugin)(nil)
 )
 
-// normalizeModel produces basename keys for upstream-name rewrites and legacy
-// bare shorthand. Routing uses routingModelKey instead to preserve namespaces.
+// normalizeModel produces basename keys for upstream-name rewrites and
+// commandcode-prefixed shorthand. Routing uses routingModelKey to keep prefixes.
 func normalizeModel(model string) string {
 	m := strings.TrimSpace(model)
 	if i := strings.LastIndex(m, "/"); i >= 0 {

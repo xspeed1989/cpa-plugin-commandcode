@@ -7,7 +7,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
-// Router hijacks commandcode-owned models to this plugin's executor.
+// Router handles configured models only in the commandcode/ namespace.
 // The host consults routers in priority order before built-in provider
 // resolution; returning Handled=false falls through to the normal
 // openai-compatibility path (safe default during rollout).
@@ -29,16 +29,12 @@ func routingModelKey(model string) string {
 
 func (r *Router) owned(req pluginapi.ModelRouteRequest) bool {
 	r.cfg.ensureIndexes()
-	set := r.cfg.modelSet()
-	for _, candidate := range []string{req.RequestedModel, modelFromBody(req.Body)} {
-		if candidate == "" {
-			continue
-		}
-		if _, ok := set[routingModelKey(candidate)]; ok {
-			return true
-		}
+	model := req.RequestedModel
+	if strings.TrimSpace(model) == "" {
+		model = modelFromBody(req.Body)
 	}
-	return false
+	_, owned := r.cfg.modelSet()[routingModelKey(model)]
+	return owned
 }
 
 // RouteModel routes commandcode models to this plugin's own executor.
@@ -54,9 +50,8 @@ func (r *Router) RouteModel(ctx context.Context, req pluginapi.ModelRouteRequest
 	}, nil
 }
 
-// modelFromBody extracts the model field from a raw client payload so the
-// router also matches when RequestedModel is an alias the host already
-// rewrote (or vice versa).
+// modelFromBody extracts the payload model only when RequestedModel is absent.
+// An explicit RequestedModel is authoritative; the body cannot widen ownership.
 func modelFromBody(body []byte) string {
 	if len(body) == 0 {
 		return ""

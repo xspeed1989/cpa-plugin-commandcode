@@ -29,8 +29,8 @@ type modelDef struct {
 // openai-compatibility channel (cmd-订阅) already registers the bare upstream
 // names; RegisterExecutors skips plugin models that any native executor serves
 // (modelHasNativeExecutor), so reusing those IDs would leave this executor
-// permanently unregistered. The router matches client aliases to this
-// executor, so clients keep requesting deepseek-flash unchanged.
+// permanently unregistered. The router accepts only commandcode-prefixed
+// aliases and upstream names, leaving bare model IDs to the host's routing.
 func (p *ModelProvider) registryModels() []modelDef {
 	entries := p.cfg.effectiveModels()
 	defs := make([]modelDef, 0, len(entries))
